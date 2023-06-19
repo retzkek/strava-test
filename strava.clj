@@ -13,7 +13,7 @@
 
 (def default-config
   {:url "https://www.strava.com/api/v3"
-    :client-id 109202
+    :client-id  "109202"
     :client-secret ""
     :access-token ""
     :access-expires-at 0
@@ -31,6 +31,19 @@
 (defn write-config []
   (spit (fs/unixify config-path) @api-config))
 
+(defn init []
+  (let [conf {:client-id
+              (do
+                (print "Client ID: ")
+                (flush)
+                (read-line))
+              :client-secret
+              (do
+                (print "Client secret: ")
+                (flush)
+                (read-line))}]
+    (swap! api-config merge conf)
+    (write-config)))
 
 (def oauth-done (chan))
 
@@ -56,14 +69,24 @@
   (oauth-server)
   )
 
-(defn get-token [code]
-  (http/post "https://www.strava.com/oauth/token"
-             {:form-params {"client_id" (@api-config :client-id)
-                            "client_secret" (@api-config :client-secret)
-                            "code" code
-                            "grant_type" "authorization_code"}
-              :headers {"Accept" "application/json"}})
-  )
+(defn get-refresh-token [code]
+  (try
+    (->
+     (http/post "https://www.strava.com/api/v3/oauth/token"
+                {:form-params {"client_id" (@api-config :client-id)
+                               "client_secret" (@api-config :client-secret)
+                               "code" code
+                               "grant_type" "authorization_code"}
+                 :headers {"Accept" "application/json"}})
+     :body
+     (json/parse-string true))
+    (catch Exception e (pprint (:body (ex-data e))))))
+
+(defn save-tokens [& {:keys [refresh_token access_token expires_at]}]
+  (swap! api-config merge {:access-token access_token
+                            :access-expires-at expires_at
+                            :refresh-token refresh_token})
+  (write-config))
 
 (defn login []
   (let [srv (hk/run-server oauth-app {:ip "127.0.0.1" :port (@api-config :local-oauth-server-port)})]
@@ -73,9 +96,11 @@
                           "client_id=" (@api-config :client-id)
                           "&redirect_uri=" (java.net.URLEncoder/encode (format "http://localhost:%d/authorize" (@api-config :local-oauth-server-port)))
                           "&response_type=code&scope=read_all,activity:read_all"))
-        (<!! oauth-done)
-        ;; TODO get the tokens using the code
-        )
+        (-> (<!! oauth-done)
+            (get "code")
+            get-refresh-token
+            save-tokens
+            ))
       (catch Exception e (str "exception opening oauth URL: " (.getMessage e)))
       (finally
         (srv)))))
