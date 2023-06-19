@@ -5,6 +5,7 @@ with pkgs;
 mkShell {
   name="strava-test";
   buildInputs = [
+    jdk
     babashka
   ];
 }

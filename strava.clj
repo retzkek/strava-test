@@ -1,46 +1,91 @@
-(require '[babashka.http-client :as http]
-         '[org.httpkit.server :as hk])
+(ns strava
+  (:require [babashka.fs :as fs]
+            [clojure.edn :as edn]
+            [clojure.core.async :refer [chan >!! <!!]]
+            [babashka.http-client :as http]
+            [clojure.pprint :refer [pprint]]
+            [cheshire.core :as json]
+            [org.httpkit.server :as hk]
+            [ring.util.codec :as codec])
+  (:use [clojure.java.browse]))
 
-(use 'clojure.java.browse)
+(def config-path (fs/path (fs/xdg-config-home) "strava" "api.edn"))
 
-(def config-path (fs/path (fs/xdg-config-home) "strava"))
+(def default-config
+  {:url "https://www.strava.com/api/v3"
+    :client-id 109202
+    :client-secret ""
+    :access-token ""
+    :access-expires-at 0
+    :refresh-token ""
+    :local-oauth-server-port 3172})
 
-(def api-config
-  (let [f (fs/path config-path "api.edn")]
-    (merge
-     {:url "https://www.strava.com/api/v3"
-      :client-id 109202
-      :access-token ""
-      :refresh-token ""
-      :local-oauth-server-port 3172}
-     (when (fs/exists? f)
-       (edn/read-string (slurp (fs/unixify f)))))))
+(defn load-config []
+  (merge
+   default-config
+   (when (fs/exists? config-path)
+     (edn/read-string (slurp (fs/unixify config-path))))))
 
+(def api-config (atom (load-config)))
+
+(defn write-config []
+  (spit (fs/unixify config-path) @api-config))
+
+
+(def oauth-done (chan))
 
 (defn oauth-app [req]
-  {:status 200
-   :headers {"Content-Type" "text/plain"}
-   :body "got it!"})
+  (pprint req)
+  (case (:uri req)
+    "/ping"
+    {:status 200
+     :headers {"Content-Type" "text/plain"}
+     :body "hello"}
+    "/authorize"
+    (do
+      (>!! oauth-done (codec/form-decode (req :query-string)))
+      {:status 200
+       :headers {"Content-Type" "text/plain"}
+       :body "got it! You can close this window."})
+    {:status 404
+     :headers {"Content-Type" "text/plain"}
+     :body "404 not found"}))
 
 (comment
   (def oauth-server (hk/run-server oauth-app {:port 3172}))
   (oauth-server)
   )
 
+(defn get-token [code]
+  (http/post "https://www.strava.com/oauth/token"
+             {:form-params {"client_id" (@api-config :client-id)
+                            "client_secret" (@api-config :client-secret)
+                            "code" code
+                            "grant_type" "authorization_code"}
+              :headers {"Accept" "application/json"}})
+  )
+
 (defn login []
-  (let [srv (hk/run-server oauth-app {:ip "127.0.0.1" :port (api-config :local-oauth-server-port)})]
-    (browse-url (str  "https://www.strava.com/oauth/authorize?"
-                      "client_id=" (api-config :client-id)
-                      "&redirect_uri=" (java.net.URLEncoder/encode (format "http://localhost:%d/authorize" (api-config :local-oauth-server-port)))
-                      "&response_type=code&scope=read_all,activity:read_all"))
-    (srv)))
+  (let [srv (hk/run-server oauth-app {:ip "127.0.0.1" :port (@api-config :local-oauth-server-port)})]
+    (try
+      (do
+        (browse-url (str  "https://www.strava.com/oauth/authorize?"
+                          "client_id=" (@api-config :client-id)
+                          "&redirect_uri=" (java.net.URLEncoder/encode (format "http://localhost:%d/authorize" (@api-config :local-oauth-server-port)))
+                          "&response_type=code&scope=read_all,activity:read_all"))
+        (<!! oauth-done)
+        ;; TODO get the tokens using the code
+        )
+      (catch Exception e (str "exception opening oauth URL: " (.getMessage e)))
+      (finally
+        (srv)))))
 
 (defn strava-get [endpoint params]
   (->
-   (http/get (str strava-api-url endpoint)
+   (http/get (str (@api-config :url) endpoint)
              {:headers {
                         "Accept" "application/json"
-                        "Authorization" (str "Bearer " strava-api-token)
+                        "Authorization" (str "Bearer " (@api-config :access-token))
                         }
               :query-params params
               })
@@ -58,8 +103,6 @@
               {:after (epoch from)
                :before (epoch to)}))
 
-
-(http/get (str strava-api-url "/athlete/activities"))
 
 (comment
   (strava-get "/athlete" nil)
